@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mx:Application xmlns:mx="http://www.adobe.com/2006/mxml" layout="absolute" creationComplete="initVideo()">
+    <mx:Script>
+        <![CDATA[
+        	import mx.controls.Label;
+        	import mixin.scancam.Paper;
+        	import mixin.scancam.Corner;
+        	import mixin.scancam.CornerSet;
+        	import flash.display.Bitmap;
+        	import flash.display.BitmapData;
+            import flash.media.Camera;
+            import flash.media.Video;
+            
+            import mixin.scancam.RunLengthEncoder;
+            
+            import mx.controls.Alert;
+            import mx.controls.Image;
+            
+            import mx.core.UIComponent;
+            
+            private var video:Video;
+		    private var pixels:BitmapData;
+    		private var debug:BitmapData;
+    		private var shape:UIComponent;
+    		private var answerLabel:Label;
+            
+            private function handleFrame(event:Event):void {
+            	var all:Rectangle = new Rectangle(0, 0, pixels.width, pixels.height);
+            	var origin:Point = new Point(0, 0);
+            	
+            	pixels.draw(video);
+      			
+      			var grayPixels:BitmapData = new BitmapData(pixels.width, pixels.height, false);
+      			grayPixels.applyFilter(pixels, all, origin, new ColorMatrixFilter([
+            		0.33, 0.33, 0.33, 0, 0,
+            	 	0.33, 0.33, 0.33, 0, 0,
+            	 	0.33, 0.33, 0.33, 0, 0,
+            	 	0, 0, 0, 1, 0]));
+
+				var average:uint = 0;
+      			for (var x:int = 0; x < pixels.width; x++) {
+      				for (var y:int = 0; y < pixels.width; y++) {
+      					average += grayPixels.getPixel(x, y) & 0xff;
+      				}
+      			}
+      			average = average / (pixels.width * pixels.height);
+      			
+      			var blurPixels:BitmapData = new BitmapData(pixels.width, pixels.height, false);
+      			blurPixels.applyFilter(grayPixels, all, origin, new BlurFilter(32, 32, 1));
+
+				// Pixels that are significantly darker than average or a little darker than their
+				// neighborhood are considered to be black pixels.
+      			for (x = 0; x < pixels.width; x++) {
+      				for (y = 0; y < pixels.width; y++) {
+      					var value:uint = grayPixels.getPixel(x, y) & 0xff;
+      					var blurValue:uint = blurPixels.getPixel(x, y) & 0xff;
+      					
+      					if (value < (blurValue * 0.97) || value < (average * 0.8)) {
+      						debug.setPixel(x, y, 0x0);
+      					} else {
+      						debug.setPixel(x, y, 0xffffff);
+      					}
+      				}
+      			}
+      			
+      			var corners:CornerSet = new CornerSet();
+      			
+      			// Now, we try to find the targets.
+      			for (y = 0; y < pixels.height; y++) {
+      				var runLengthEncoder:RunLengthEncoder = new RunLengthEncoder();
+      				for (x = 0; x < pixels.width; x++) {
+      					runLengthEncoder.handlePixel(debug.getPixel(x, y));
+      				}      				
+      				var runs:Array = runLengthEncoder.getResult();
+      				
+      				var offset:int = 0;
+      				for (var i:int = 0; i < runs.length - 4; i += 2) {
+      					var bullseye:Object = checkBullseye(runs, i, offset, 0.6, 0.6);
+      					if (bullseye) {
+      						var verticalBullseye:Object =
+      							doubleCheckBullseye(debug, bullseye.center, y, bullseye.size) ||
+      							doubleCheckBullseye(debug, bullseye.center - 1, y, bullseye.size) ||
+      							doubleCheckBullseye(debug, bullseye.center + 1, y, bullseye.size);
+      						if (verticalBullseye) {
+      							var corner:Corner = new Corner();
+      							corner.left = bullseye.start;
+      							corner.center = bullseye.center;
+      							corner.width = bullseye.size;
+      							corner.top = verticalBullseye.start;
+      							corner.middle = verticalBullseye.center;
+      							corner.height = verticalBullseye.size;
+      							
+      							corners.add(corner);
+      						}
+      					}
+      					offset += runs[i] + runs[i + 1];      					
+      				}
+      			}
+      			
+      			shape.graphics.clear();
+      			answerLabel.text = '';
+      			
+      			corners.draw(shape.graphics);
+      			
+      			var paper:Paper = corners.getPaper();
+      			if (paper) {
+      				paper.draw(shape.graphics);
+      				answerLabel.text += paper.scan(debug, 0.25) || '?';
+      				answerLabel.text += paper.scan(debug, 0.5) || '?';
+      				answerLabel.text += paper.scan(debug, 0.75) || '?';
+      			}
+            }
+            
+            private function checkBullseye(runs:Array, i:int, offset:int, accuracy:Number, crossColorAccuracy:Number):Object {
+  				if (runs[i] > 2 &&
+  				    Math.abs(runs[i] * 2 - runs[i + 2]) <= (runs[i + 2] * accuracy) &&
+  				    Math.abs(runs[i + 2] - runs[i + 4] * 2) <= (runs[i + 2] * accuracy) &&
+  				    Math.abs(runs[i + 1] - runs[i + 3]) <= (runs[i + 1] * accuracy) &&
+  				    Math.abs(runs[i] - runs[i + 1]) <= (runs[i + 1] * crossColorAccuracy) &&
+  				    Math.abs(runs[i+3] - runs[i + 4]) <= (runs[i + 3] * crossColorAccuracy)) {
+  				    return {
+  				    	start: offset,
+  				    	center: offset + runs[i] + runs[i + 1] + runs[i + 2] / 2,
+  				    	size: runs[i] + runs[i + 1] + runs[i + 2] + runs[i + 3] + runs[i + 4]
+  				    }
+  				}
+  				return null;
+            }
+            
+            private function doubleCheckBullseye(pixels:BitmapData, center:int, estimatedMiddle:int, size:int):Object {
+            	var runLengthEncoder:RunLengthEncoder = new RunLengthEncoder();
+      			for (var y:int = 0; y < pixels.height; y++) {
+      				runLengthEncoder.handlePixel(debug.getPixel(center, y));
+      			}      				
+      			var runs:Array = runLengthEncoder.getResult();
+      			
+  				var offset:int = 0;
+  				for (var i:int = 0; i < runs.length - 4; i += 2) {
+  					if (Math.abs((offset + size / 2) - estimatedMiddle) < size * 0.4) {
+  						var bullseye:Object = checkBullseye(runs, i, offset, 0.6, 0.6);
+  						if (bullseye) {
+  							return bullseye;
+  						}	
+  					}
+  					offset += runs[i] + runs[i + 1];      					
+  				}
+  				return null;
+            }
+            
+            private function createBitmap(pixels:BitmapData, x:int, y:int):Bitmap {
+      			var result:Bitmap = new Bitmap(pixels);
+      			result.x = 0;
+      			result.y = 0;
+      			result.width = pixels.width;
+      			result.height = pixels.height;
+      			
+      			// Add a sprite with this bitmap to the screen.
+				var myImage:Image = new Image();
+				myImage.source = result;
+      			myImage.x = x;
+      			myImage.y = y;
+      			myImage.width = pixels.width;
+      			myImage.height = pixels.height;
+      			addChild(myImage);
+      			
+      			// Return the bitmap.
+      			return result;
+    		}
+ 
+            private function initVideo():void {
+            	// Hack to auto-select iSight camera on Mac (JPEGCam Issue #5, submitted by manuel.gonzalez.noriega)
+                // From: http://www.squidder.com/2009/03/09/trick-auto-select-mac-isight-in-flash/
+                var cameraIdx:int = -1;
+                for (var idx:int = 0, len:int = Camera.names.length; idx < len; idx++) {
+                	if (Camera.names[idx] == "USB Video Class Video") {
+                    	cameraIdx = idx;
+						idx = len;
+					}
+                }
+                
+                var camera:Camera;
+                if (cameraIdx >= 0) {
+                	camera = Camera.getCamera(String(cameraIdx));
+                } else {
+                	camera = Camera.getCamera();
+                }
+                if (camera) {                   
+                    camera.setQuality(0, 100);
+                    
+                    // Get more pixels less frequently.
+                    camera.setMode(480, 360, 5);
+                    
+                    // Do not detect motion (may help reduce CPU usage);
+                    camera.setMotionLevel(100);
+                    
+                    video = new Video(camera.width, camera.height);
+        			video.attachCamera(camera);
+                    pixels = new BitmapData(video.width, video.height, false, 0x00000000);
+        			debug = new BitmapData(video.width, video.height, false, 0x00000000);
+        			createBitmap(debug, 0, 0);
+        			
+        			shape = new UIComponent();
+        			shape.x = 0;
+        			shape.y = 0;
+        			shape.width = pixels.width;
+        			shape.height = pixels.height;
+        			rawChildren.addChild(shape);
+        			
+        			answerLabel = new Label();
+        			answerLabel.x = 0;
+        			answerLabel.y = 0;
+        			answerLabel.width = pixels.width;
+        			answerLabel.height = pixels.height;
+        			answerLabel.setStyle('fontFamily', 'Arial,Helvetica,sans-serif');
+        			answerLabel.setStyle('fontSize', 240);
+        			answerLabel.setStyle('color', '0xffff00');
+        			answerLabel.setStyle('font-weight', 'bold');
+        			answerLabel.setStyle('textAlign', 'center');
+        			answerLabel.alpha = 0.5;
+        			answerLabel.text = '';        			
+        			addChild(answerLabel);
+        			
+        			var timer:Timer = new Timer(200, 0);
+        			timer.addEventListener(TimerEvent.TIMER, handleFrame);
+        			timer.start();          			
+                } else {
+                    Alert.show("You don't seem to have a camera.");
+                }
+            }
+        ]]>
+    </mx:Script>
+</mx:Application>
